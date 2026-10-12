@@ -13,12 +13,6 @@ and exposes a socks5/http proxy or tunnels on the machine. This can be useful if
 to connect to certain sites via a wireguard peer, but can't be bothered to setup a new network
 interface for whatever reasons.
 
-# Main Sponsor
-
-<a href="https://www.rapidproxy.io/?ref=wire"><img src="./assets/rapidproxy.png" width="300" alt="Rapidproxy"></a>
-
-[RapidProxy](https://www.rapidproxy.io/?ref=wire) is a residential proxy platform with 90M+ real IPs across 200+ countries. It supports rotation, geo-targeting, and high concurrency to improve scraping success and reduce bans. Start your free trial today!
-
 # Why you might want this
 
 - You simply want to use wireguard as a way to proxy some traffic.
@@ -326,11 +320,3 @@ CheckAlive = 1.1.1.1
 If nothing is set for `CheckAlive`, an empty JSON object with 200 will be the response.
 
 The peer which the ICMP ping packet is routed to depends on the `AllowedIPs` set for each peers.
-
-# Secondary sponsors 
-<p>This project is supported by the DigitalOcean Open Source Credits Program:</p>
-<p>
-  <a href="https://www.digitalocean.com/">
-    <img src="https://opensource.nyc3.cdn.digitaloceanspaces.com/attribution/assets/SVG/DO_Logo_horizontal_blue.svg" width="201px">
-  </a>
-</p>
