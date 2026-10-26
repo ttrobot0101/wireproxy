@@ -8,10 +8,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"golang.org/x/net/icmp"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
-	"golang.zx2c4.com/wireguard/device"
 	"io"
 	"log"
 	"math/rand"
@@ -23,6 +19,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
+	"golang.zx2c4.com/wireguard/device"
 
 	"github.com/things-go/go-socks5"
 	"github.com/things-go/go-socks5/bufferpool"
@@ -43,10 +44,11 @@ type CredentialValidator struct {
 
 // VirtualTun stores a reference to netstack network and DNS configuration
 type VirtualTun struct {
-	Tnet      *netstack.Net
-	Dev       *device.Device
-	SystemDNS bool
-	Conf      *DeviceConfig
+	Tnet          *netstack.Net
+	Dev           *device.Device
+	SystemDNS     bool
+	Conf          *DeviceConfig
+	ResolveConfig *ResolveConfig
 	// PingRecord stores the last time an IP was pinged
 	PingRecord     map[string]uint64
 	PingRecordLock *sync.Mutex
@@ -79,33 +81,48 @@ func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*n
 		return nil, err
 	}
 
-	size := len(addrs)
-	if size == 0 {
-		return nil, errors.New("no address found for: " + name)
-	}
+	addrs_v4 := []netip.Addr{}
+	addrs_v6 := []netip.Addr{}
 
-	rand.Shuffle(size, func(i, j int) {
-		addrs[i], addrs[j] = addrs[j], addrs[i]
-	})
-
-	var addr netip.Addr
 	for _, saddr := range addrs {
-		addr, err = netip.ParseAddr(saddr)
+		addr, err := netip.ParseAddr(saddr)
 		if err == nil {
-			break
+			if addr.Is4() {
+				addrs_v4 = append(addrs_v4, addr)
+			} else if addr.Is6() {
+				addrs_v6 = append(addrs_v6, addr)
+			}
 		}
 	}
 
-	if err != nil {
-		return nil, err
+	rand.Shuffle(len(addrs_v4), func(i, j int) {
+		addrs_v4[i], addrs_v4[j] = addrs_v4[j], addrs_v4[i]
+	})
+	rand.Shuffle(len(addrs_v6), func(i, j int) {
+		addrs_v6[i], addrs_v6[j] = addrs_v6[j], addrs_v6[i]
+	})
+
+	addrs_all := []netip.Addr{}
+
+	switch d.ResolveConfig.ResolveStrategy {
+	case "ipv4":
+		addrs_all = append(addrs_v4, addrs_v6...)
+	case "ipv6":
+		addrs_all = append(addrs_v6, addrs_v4...)
 	}
 
-	return &addr, nil
+	if len(addrs_all) == 0 {
+		return nil, errors.New("no address found for: " + name)
+	}
+
+	return &addrs_all[0], nil
 }
 
 // Resolve resolves a hostname and returns an IP.
 // DNS traffic may or may not be routed depending on VirtualTun's setting
 func (d VirtualTun) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
+	log.Printf("Resolving address for %s\n", name)
+
 	addr, err := d.ResolveAddrWithContext(ctx, name)
 	if err != nil {
 		return nil, nil, err
@@ -138,6 +155,46 @@ func (d VirtualTun) resolveToAddrPort(endpoint *addressPort) (*netip.AddrPort, e
 	return &addrPort, nil
 }
 
+// passthroughResolver is a socks5 NameResolver that performs no resolution: it
+// leaves the FQDN untouched (returns a nil IP) so the FQDN survives to the dial
+// callback, where the domain-based routing decision is made. Resolution then
+// happens on the chosen network — the tunnel netstack for tunnelled hosts, the
+// system resolver for direct hosts.
+type passthroughResolver struct{}
+
+func (passthroughResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
+	return ctx, nil, nil
+}
+
+// RoutedDial returns a dialer that sends whitelisted hosts through the tunnel
+// and dials everything else directly. Used by the HTTP and SNI proxies, whose
+// dial callbacks receive the destination hostname intact.
+func (d VirtualTun) RoutedDial(router *DomainRouter) func(network, address string) (net.Conn, error) {
+	return func(network, address string) (net.Conn, error) {
+		if router.route(hostFromAddr(address)) {
+			return d.Tnet.Dial(network, address)
+		}
+		return net.Dial(network, address)
+	}
+}
+
+// routedSocks5Dial returns a socks5 dial-with-request callback that routes based
+// on the original destination FQDN (preserved on request.DestAddr), falling back
+// to the address host for IP-literal targets.
+func (d VirtualTun) routedSocks5Dial(router *DomainRouter) func(context.Context, string, string, *socks5.Request) (net.Conn, error) {
+	return func(ctx context.Context, network, address string, request *socks5.Request) (net.Conn, error) {
+		host := request.DestAddr.FQDN
+		if host == "" {
+			host = hostFromAddr(address)
+		}
+		if router.route(host) {
+			return d.Tnet.DialContext(ctx, network, address)
+		}
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, network, address)
+	}
+}
+
 // SpawnRoutine spawns a socks5 server.
 func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 	var authMethods []socks5.Authenticator
@@ -150,10 +207,23 @@ func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 	}
 
 	options := []socks5.Option{
-		socks5.WithDial(vt.Tnet.DialContext),
-		socks5.WithResolver(vt),
 		socks5.WithAuthMethods(authMethods),
 		socks5.WithBufferPool(bufferpool.NewPool(256 * 1024)),
+	}
+
+	if len(config.TunnelDomains) == 0 && !config.LogDomains {
+		// Legacy path: everything through the tunnel, resolved via tunnel DNS.
+		options = append(options,
+			socks5.WithDial(vt.Tnet.DialContext),
+			socks5.WithResolver(vt),
+		)
+	} else {
+		// Split-routing path: keep the FQDN so we can decide per connection.
+		router := NewDomainRouter(config.TunnelDomains, config.LogDomains)
+		options = append(options,
+			socks5.WithDialAndRequest(vt.routedSocks5Dial(router)),
+			socks5.WithResolver(passthroughResolver{}),
+		)
 	}
 
 	server := socks5.NewServer(options...)
@@ -165,13 +235,18 @@ func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 
 // SpawnRoutine spawns a http server.
 func (config *HTTPConfig) SpawnRoutine(vt *VirtualTun) {
+	router := NewDomainRouter(config.TunnelDomains, config.LogDomains)
 	server := &HTTPServer{
 		config: config,
-		dial:   vt.Tnet.Dial,
+		dial:   vt.RoutedDial(router),
 		auth:   CredentialValidator{config.Username, config.Password},
 	}
 	if config.Username != "" || config.Password != "" {
 		server.authRequired = true
+	}
+
+	if config.CertFile != "" && config.KeyFile != "" {
+		server.tlsRequired = true
 	}
 
 	if err := server.ListenAndServe("tcp", config.BindAddress); err != nil {
@@ -189,11 +264,11 @@ func (c CredentialValidator) Valid(username, password string) bool {
 
 // connForward copy data from `from` to `to`
 func connForward(from io.ReadWriteCloser, to io.ReadWriteCloser) {
-	defer from.Close()
-	defer to.Close()
+	defer func() { _ = from.Close() }()
+	defer func() { _ = to.Close() }()
 
 	_, err := io.Copy(to, from)
-	if err != nil {
+	if err != nil && !errors.Is(err, net.ErrClosed) {
 		errorLogger.Printf("Cannot forward traffic: %s\n", err.Error())
 	}
 }
@@ -202,14 +277,16 @@ func connForward(from io.ReadWriteCloser, to io.ReadWriteCloser) {
 func tcpClientForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 	target, err := vt.resolveToAddrPort(raddr)
 	if err != nil {
+		_ = conn.Close()
 		errorLogger.Printf("TCP Server Tunnel to %s: %s\n", target, err.Error())
 		return
 	}
 
-	tcpAddr := TCPAddrFromAddrPort(*target)
+	tcpAddr := net.TCPAddrFromAddrPort(*target)
 
 	sconn, err := vt.Tnet.DialTCP(tcpAddr)
 	if err != nil {
+		_ = conn.Close()
 		errorLogger.Printf("TCP Client Tunnel to %s: %s\n", target, err.Error())
 		return
 	}
@@ -219,29 +296,22 @@ func tcpClientForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 }
 
 // STDIOTcpForward starts a new connection via wireguard and forward traffic from `conn`
-func STDIOTcpForward(vt *VirtualTun, raddr *addressPort) {
+func STDIOTcpForward(vt *VirtualTun, raddr *addressPort, input *os.File, output *os.File) {
 	target, err := vt.resolveToAddrPort(raddr)
 	if err != nil {
 		errorLogger.Printf("Name resolution error for %s: %s\n", raddr.address, err.Error())
 		return
 	}
 
-	// os.Stdout has previously been remapped to stderr, se we can't use it
-	stdout, err := os.OpenFile("/dev/stdout", os.O_WRONLY, 0)
-	if err != nil {
-		errorLogger.Printf("Failed to open /dev/stdout: %s\n", err.Error())
-		return
-	}
-
-	tcpAddr := TCPAddrFromAddrPort(*target)
+	tcpAddr := net.TCPAddrFromAddrPort(*target)
 	sconn, err := vt.Tnet.DialTCP(tcpAddr)
 	if err != nil {
 		errorLogger.Printf("TCP Client Tunnel to %s (%s): %s\n", target, tcpAddr, err.Error())
 		return
 	}
 
-	go connForward(os.Stdin, sconn)
-	go connForward(sconn, stdout)
+	go connForward(input, sconn)
+	go connForward(sconn, output)
 }
 
 // SpawnRoutine spawns a local TCP server which acts as a proxy to the specified target
@@ -272,21 +342,23 @@ func (conf *STDIOTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 		log.Fatal(err)
 	}
 
-	go STDIOTcpForward(vt, raddr)
+	go STDIOTcpForward(vt, raddr, conf.Input, conf.Output)
 }
 
 // tcpServerForward starts a new connection locally and forward traffic from `conn`
 func tcpServerForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 	target, err := vt.resolveToAddrPort(raddr)
 	if err != nil {
+		_ = conn.Close()
 		errorLogger.Printf("TCP Server Tunnel to %s: %s\n", target, err.Error())
 		return
 	}
 
-	tcpAddr := TCPAddrFromAddrPort(*target)
+	tcpAddr := net.TCPAddrFromAddrPort(*target)
 
 	sconn, err := net.DialTCP("tcp", nil, tcpAddr)
 	if err != nil {
+		_ = conn.Close()
 		errorLogger.Printf("TCP Server Tunnel to %s: %s\n", target, err.Error())
 		return
 	}
@@ -318,11 +390,37 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	}
 }
 
+// SpawnRoutine spawns an SNI proxy server.
+func (config *SNIConfig) SpawnRoutine(vt *VirtualTun) {
+	router := NewDomainRouter(config.TunnelDomains, config.LogDomains)
+	dial := vt.RoutedDial(router)
+
+	listener, err := net.Listen("tcp", config.BindAddress)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Fatal(err)
+		}
+		go sniServe(dial, conn)
+	}
+}
+
 func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Health metric request: %s\n", r.URL.Path)
 	switch path.Clean(r.URL.Path) {
 	case "/readyz":
-		body, err := json.Marshal(d.PingRecord)
+		d.PingRecordLock.Lock()
+		records := make(map[string]uint64, len(d.PingRecord))
+		for addr, record := range d.PingRecord {
+			records[addr] = record
+		}
+		d.PingRecordLock.Unlock()
+
+		body, err := json.Marshal(records)
 		if err != nil {
 			errorLogger.Printf("Failed to get device metrics: %s\n", err.Error())
 			w.WriteHeader(http.StatusInternalServerError)
@@ -330,7 +428,7 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		status := http.StatusOK
-		for _, record := range d.PingRecord {
+		for _, record := range records {
 			lastPong := time.Unix(int64(record), 0)
 			// +2 seconds to account for the time it takes to ping the IP
 			if time.Since(lastPong) > time.Duration(d.Conf.CheckAliveInterval+2)*time.Second {
@@ -379,9 +477,18 @@ func (d VirtualTun) pingIPs() {
 			errorLogger.Printf("Failed to ping %s: %s\n", addr, err.Error())
 			continue
 		}
+		if !addr.Is4() && !addr.Is6() {
+			errorLogger.Printf("Failed to ping %s: invalid address: %s\n", addr, addr.String())
+			_ = socket.Close()
+			continue
+		}
 
 		data := make([]byte, 16)
-		_, _ = srand.Read(data)
+		if _, err := srand.Read(data); err != nil {
+			errorLogger.Printf("Failed to generate ping data for %s: %s\n", addr, err.Error())
+			_ = socket.Close()
+			continue
+		}
 
 		requestPing := icmp.Echo{
 			Seq:  rand.Intn(1 << 16),
@@ -390,30 +497,38 @@ func (d VirtualTun) pingIPs() {
 
 		var icmpBytes []byte
 		if addr.Is4() {
-			icmpBytes, _ = (&icmp.Message{Type: ipv4.ICMPTypeEcho, Code: 0, Body: &requestPing}).Marshal(nil)
+			icmpBytes, err = (&icmp.Message{Type: ipv4.ICMPTypeEcho, Code: 0, Body: &requestPing}).Marshal(nil)
 		} else if addr.Is6() {
-			icmpBytes, _ = (&icmp.Message{Type: ipv6.ICMPTypeEchoRequest, Code: 0, Body: &requestPing}).Marshal(nil)
-		} else {
-			errorLogger.Printf("Failed to ping %s: invalid address: %s\n", addr, addr.String())
+			icmpBytes, err = (&icmp.Message{Type: ipv6.ICMPTypeEchoRequest, Code: 0, Body: &requestPing}).Marshal(nil)
+		}
+		if err != nil {
+			errorLogger.Printf("Failed to marshal ping request for %s: %s\n", addr, err.Error())
+			_ = socket.Close()
 			continue
 		}
 
-		_ = socket.SetReadDeadline(time.Now().Add(time.Duration(d.Conf.CheckAliveInterval) * time.Second))
+		if err := socket.SetReadDeadline(time.Now().Add(time.Duration(d.Conf.CheckAliveInterval) * time.Second)); err != nil {
+			errorLogger.Printf("Failed to set ping deadline for %s: %s\n", addr, err.Error())
+			_ = socket.Close()
+			continue
+		}
 		_, err = socket.Write(icmpBytes)
 		if err != nil {
 			errorLogger.Printf("Failed to ping %s: %s\n", addr, err.Error())
+			_ = socket.Close()
 			continue
 		}
 
-		addr := addr
-		go func() {
-			n, err := socket.Read(icmpBytes[:])
+		go func(addr netip.Addr, socket net.Conn, requestPing icmp.Echo) {
+			defer func() { _ = socket.Close() }()
+			readBytes := make([]byte, 1500)
+			n, err := socket.Read(readBytes)
 			if err != nil {
 				errorLogger.Printf("Failed to read ping response from %s: %s\n", addr, err.Error())
 				return
 			}
 
-			replyPacket, err := icmp.ParseMessage(1, icmpBytes[:n])
+			replyPacket, err := icmp.ParseMessage(1, readBytes[:n])
 			if err != nil {
 				errorLogger.Printf("Failed to parse ping response from %s: %s\n", addr, err.Error())
 				return
@@ -437,6 +552,10 @@ func (d VirtualTun) pingIPs() {
 					errorLogger.Printf("Failed to parse ping response from %s: invalid reply type: %s\n", addr, replyPacket.Type)
 					return
 				}
+				if len(replyPing.Data) < 4 {
+					errorLogger.Printf("Failed to parse ping response from %s: reply too short\n", addr)
+					return
+				}
 
 				seq := binary.BigEndian.Uint16(replyPing.Data[2:4])
 				pongBody := replyPing.Data[4:]
@@ -449,16 +568,16 @@ func (d VirtualTun) pingIPs() {
 			d.PingRecordLock.Lock()
 			d.PingRecord[addr.String()] = uint64(time.Now().Unix())
 			d.PingRecordLock.Unlock()
-
-			defer socket.Close()
-		}()
+		}(addr, socket, requestPing)
 	}
 }
 
 func (d VirtualTun) StartPingIPs() {
+	d.PingRecordLock.Lock()
 	for _, addr := range d.Conf.CheckAlive {
 		d.PingRecord[addr.String()] = 0
 	}
+	d.PingRecordLock.Unlock()
 
 	go func() {
 		for {

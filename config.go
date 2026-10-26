@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/go-ini/ini"
@@ -33,6 +35,12 @@ type DeviceConfig struct {
 	CheckAliveInterval int
 }
 
+type UDPProxyTunnelConfig struct {
+	BindAddress       string
+	Target            string
+	InactivityTimeout int
+}
+
 type TCPClientTunnelConfig struct {
 	BindAddress *net.TCPAddr
 	Target      string
@@ -40,6 +48,8 @@ type TCPClientTunnelConfig struct {
 
 type STDIOTunnelConfig struct {
 	Target string
+	Input  *os.File
+	Output *os.File
 }
 
 type TCPServerTunnelConfig struct {
@@ -48,20 +58,37 @@ type TCPServerTunnelConfig struct {
 }
 
 type Socks5Config struct {
-	BindAddress string
-	Username    string
-	Password    string
+	BindAddress   string
+	Username      string
+	Password      string
+	TunnelDomains []*regexp.Regexp
+	LogDomains    bool
+}
+
+type SNIConfig struct {
+	BindAddress   string
+	TunnelDomains []*regexp.Regexp
+	LogDomains    bool
 }
 
 type HTTPConfig struct {
-	BindAddress string
-	Username    string
-	Password    string
+	BindAddress   string
+	Username      string
+	Password      string
+	CertFile      string
+	KeyFile       string
+	TunnelDomains []*regexp.Regexp
+	LogDomains    bool
+}
+
+type ResolveConfig struct {
+	ResolveStrategy string
 }
 
 type Configuration struct {
 	Device   *DeviceConfig
 	Routines []RoutineSpawner
+	Resolve  *ResolveConfig
 }
 
 func parseString(section *ini.Section, keyName string) (string, error) {
@@ -95,7 +122,7 @@ func parsePort(section *ini.Section, keyName string) (int, error) {
 		return 0, err
 	}
 
-	if !(port >= 0 && port < 65536) {
+	if port < 0 || port >= 65536 {
 		return 0, errors.New("port should be >= 0 and < 65536")
 	}
 
@@ -175,7 +202,7 @@ func parseCIDRNetIP(section *ini.Section, keyName string) ([]netip.Addr, error) 
 		if len(str) == 0 {
 			continue
 		}
-    
+
 		if addr, err := netip.ParseAddr(str); err == nil {
 			ips = append(ips, addr)
 		} else {
@@ -183,7 +210,7 @@ func parseCIDRNetIP(section *ini.Section, keyName string) ([]netip.Addr, error) 
 			if err != nil {
 				return nil, err
 			}
-      
+
 			addr := prefix.Addr()
 			ips = append(ips, addr)
 		}
@@ -292,6 +319,9 @@ func ParseInterface(cfg *ini.File, device *DeviceConfig) error {
 		if len(checkAlive) == 0 {
 			return errors.New("CheckAliveInterval is only valid when CheckAlive is set")
 		}
+		if value <= 0 {
+			return errors.New("CheckAliveInterval should be greater than zero")
+		}
 
 		device.CheckAliveInterval = value
 	}
@@ -377,6 +407,8 @@ func parseSTDIOTunnelConfig(section *ini.Section) (RoutineSpawner, error) {
 		return nil, err
 	}
 	config.Target = targetSection
+	config.Input = os.Stdin
+	config.Output = os.Stdout
 
 	return config, nil
 }
@@ -399,6 +431,41 @@ func parseTCPServerTunnelConfig(section *ini.Section) (RoutineSpawner, error) {
 	return config, nil
 }
 
+// parseRegexList reads a whitelist of regular expressions from a section key.
+// Each occurrence of the key (one per line; AllowShadows is enabled) is treated
+// as a single, complete regex — the value is NOT split on commas, so quantifiers
+// like `a{2,4}` work. An absent key yields no patterns. An invalid pattern is a
+// configuration error, so --configtest rejects it before any traffic flows.
+func parseRegexList(section *ini.Section, keyName string) ([]*regexp.Regexp, error) {
+	key, err := section.GetKey(keyName)
+	if err != nil {
+		return nil, nil
+	}
+
+	var patterns []*regexp.Regexp
+	for _, raw := range key.ValueWithShadows() {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		re, cerr := regexp.Compile(raw)
+		if cerr != nil {
+			return nil, errors.New("invalid " + keyName + " regex `" + raw + "`: " + cerr.Error())
+		}
+		patterns = append(patterns, re)
+	}
+	return patterns, nil
+}
+
+// parseBoolKey reads an optional boolean key, defaulting to false when absent.
+func parseBoolKey(section *ini.Section, keyName string) (bool, error) {
+	key, err := section.GetKey(keyName)
+	if err != nil {
+		return false, nil
+	}
+	return key.Bool()
+}
+
 func parseSocks5Config(section *ini.Section) (RoutineSpawner, error) {
 	config := &Socks5Config{}
 
@@ -413,6 +480,42 @@ func parseSocks5Config(section *ini.Section) (RoutineSpawner, error) {
 
 	password, _ := parseString(section, "Password")
 	config.Password = password
+
+	tunnelDomains, err := parseRegexList(section, "TunnelDomains")
+	if err != nil {
+		return nil, err
+	}
+	config.TunnelDomains = tunnelDomains
+
+	logDomains, err := parseBoolKey(section, "LogDomains")
+	if err != nil {
+		return nil, err
+	}
+	config.LogDomains = logDomains
+
+	return config, nil
+}
+
+func parseSNIConfig(section *ini.Section) (RoutineSpawner, error) {
+	config := &SNIConfig{}
+
+	bindAddress, err := parseString(section, "BindAddress")
+	if err != nil {
+		return nil, err
+	}
+	config.BindAddress = bindAddress
+
+	tunnelDomains, err := parseRegexList(section, "TunnelDomains")
+	if err != nil {
+		return nil, err
+	}
+	config.TunnelDomains = tunnelDomains
+
+	logDomains, err := parseBoolKey(section, "LogDomains")
+	if err != nil {
+		return nil, err
+	}
+	config.LogDomains = logDomains
 
 	return config, nil
 }
@@ -431,6 +534,64 @@ func parseHTTPConfig(section *ini.Section) (RoutineSpawner, error) {
 
 	password, _ := parseString(section, "Password")
 	config.Password = password
+
+	certFile, _ := parseString(section, "CertFile")
+	config.CertFile = certFile
+
+	keyFile, _ := parseString(section, "KeyFile")
+	config.KeyFile = keyFile
+
+	tunnelDomains, err := parseRegexList(section, "TunnelDomains")
+	if err != nil {
+		return nil, err
+	}
+	config.TunnelDomains = tunnelDomains
+
+	logDomains, err := parseBoolKey(section, "LogDomains")
+	if err != nil {
+		return nil, err
+	}
+	config.LogDomains = logDomains
+
+	return config, nil
+}
+
+func parseResolveConfig(section *ini.Section) (*ResolveConfig, error) {
+	config := &ResolveConfig{}
+
+	resolvStrategy, _ := parseString(section, "ResolveStrategy")
+	config.ResolveStrategy = resolvStrategy
+
+	return config, nil
+}
+
+func parseUDPProxyTunnelConfig(section *ini.Section) (RoutineSpawner, error) {
+	config := &UDPProxyTunnelConfig{}
+
+	bindAddress, err := parseString(section, "BindAddress")
+	if err != nil {
+		return nil, err
+	}
+	config.BindAddress = bindAddress
+
+	target, err := parseString(section, "Target")
+	if err != nil {
+		return nil, err
+	}
+	config.Target = target
+
+	inactivityTimeout := 0
+	if sectionKey, err := section.GetKey("InactivityTimeout"); err == nil {
+		timeoutVal, err := sectionKey.Int()
+		if err != nil {
+			return nil, err
+		}
+		if timeoutVal < 0 {
+			return nil, errors.New("InactivityTimeout should not be negative")
+		}
+		inactivityTimeout = timeoutVal
+	}
+	config.InactivityTimeout = inactivityTimeout
 
 	return config, nil
 }
@@ -472,11 +633,22 @@ func ParseConfig(path string) (*Configuration, error) {
 		MTU: 1420,
 	}
 
+	resolve := &ResolveConfig{
+		ResolveStrategy: "auto",
+	}
+
 	root := cfg.Section("")
 	wgConf, err := root.GetKey("WGConfig")
 	wgCfg := cfg
 	if err == nil {
-		wgCfg, err = ini.LoadSources(iniOpt, wgConf.String())
+		wgPath := wgConf.String()
+		// A bare filename (no path separators) is resolved relative to the
+		// directory of the parent config file, so the wg config can sit
+		// alongside the wireproxy config without needing a full path.
+		if filepath.Base(wgPath) == wgPath {
+			wgPath = filepath.Join(filepath.Dir(path), wgPath)
+		}
+		wgCfg, err = ini.LoadSources(iniOpt, wgPath)
 		if err != nil {
 			return nil, err
 		}
@@ -519,8 +691,26 @@ func ParseConfig(path string) (*Configuration, error) {
 		return nil, err
 	}
 
+	err = parseRoutinesConfig(&routinesSpawners, cfg, "SNI", parseSNIConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	if resolveSection, err := cfg.GetSection("Resolve"); err == nil {
+		resolve, err = parseResolveConfig(resolveSection)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	err = parseRoutinesConfig(&routinesSpawners, cfg, "UDPProxyTunnel", parseUDPProxyTunnelConfig)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Configuration{
 		Device:   device,
 		Routines: routinesSpawners,
+		Resolve:  resolve,
 	}, nil
 }
